@@ -3,3 +3,4 @@ aiohttp
 python-dotenv
 pytest
 pytest-asyncio
+aiosqlite
