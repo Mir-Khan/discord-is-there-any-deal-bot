@@ -1,0 +1,13 @@
+# fly.toml app configuration file generated for discord-deal-bot on 2026-05-15T02:39:20-04:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'discord-deal-bot'
+primary_region = 'iad'
+
+[build]
+
+[vm]
+  cpus = 1
+  memory_mb = 256
