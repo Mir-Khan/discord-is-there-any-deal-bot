@@ -1,7 +1,7 @@
 import pytest
 import aiohttp
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
-from main import fetch_itad_data, deal_command, GameSelectView, bot, wishlist_add, wishlist_list, wishlist_update_alert, WelcomeView, DealView
+from main import fetch_itad_data, deal_command, GameSelectView, bot, wishlist_add, wishlist_list, wishlist_update_alert, WelcomeView, DealView, wishlist_remove, wishlist_clear, force_check, set_alert_channel
 import discord
 import os
 import datetime
@@ -601,6 +601,82 @@ async def test_deal_view_add_dm():
         mock_interaction.followup.send.assert_called_once()
 
 @pytest.mark.asyncio
+async def test_wishlist_remove_success():
+    mock_interaction = MockInteraction()
+    mock_db = MagicMock()
+    mock_db.commit = AsyncMock()
+    mock_cursor = AsyncMock()
+    mock_cursor.rowcount = 1
+    mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(bot, 'db', mock_db)
+        await wishlist_remove.callback(mock_interaction, "Inscryption")
+
+        assert mock_db.execute.call_count >= 1
+        args = mock_db.execute.call_args[0]
+        assert "DELETE FROM wishlist" in args[0]
+        assert "LOWER(game_id) = LOWER(?)" in args[0]
+        mock_interaction.response.send_message.assert_called_once_with(
+            "✅ Removed 'Inscryption' from your wishlist.", ephemeral=True
+        )
+
+@pytest.mark.asyncio
+async def test_wishlist_remove_not_found():
+    mock_interaction = MockInteraction()
+    mock_db = MagicMock()
+    mock_db.commit = AsyncMock()
+    mock_cursor = AsyncMock()
+    mock_cursor.rowcount = 0
+    mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(bot, 'db', mock_db)
+        await wishlist_remove.callback(mock_interaction, "NonExistentGame")
+
+        mock_interaction.response.send_message.assert_called_once()
+        assert "Could not find" in mock_interaction.response.send_message.call_args[0][0]
+
+@pytest.mark.asyncio
+async def test_wishlist_clear():
+    mock_interaction = MockInteraction()
+    mock_db = MagicMock()
+    mock_db.commit = AsyncMock()
+    mock_cursor = AsyncMock()
+    mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(bot, 'db', mock_db)
+        await wishlist_clear.callback(mock_interaction)
+
+        args = mock_db.execute.call_args[0]
+        assert "DELETE FROM wishlist WHERE user_id = ?" in args[0]
+        assert args[1][0] == mock_interaction.user.id
+        mock_interaction.response.send_message.assert_called_once_with(
+            "✅ Your entire wishlist has been cleared.", ephemeral=True
+        )
+
+@pytest.mark.asyncio
+async def test_force_check_admin():
+    mock_interaction = MockInteraction()
+    mock_interaction.user.guild_permissions.administrator = True
+    
+    with patch.object(bot, 'check_wishlists', new_callable=AsyncMock) as mock_check:
+        await force_check.callback(mock_interaction)
+        mock_interaction.response.defer.assert_called_once()
+        mock_check.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_force_check_no_permission():
+    mock_interaction = MockInteraction()
+    mock_interaction.user.guild_permissions.administrator = False
+    
+    await force_check.callback(mock_interaction)
+    mock_interaction.response.send_message.assert_called_once_with(
+        "❌ You do not have permission to run this command.", ephemeral=True
+    )
+
+@pytest.mark.asyncio
 async def test_deal_view_add_mention():
     mock_interaction = MockInteraction()
     mock_db = MagicMock()
@@ -653,3 +729,73 @@ async def test_deal_view_remove():
         assert view.is_on_wishlist is False
         mock_interaction.response.edit_message.assert_called_once()
         mock_interaction.followup.send.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_deal_command_redirection():
+    mock_interaction = MockInteraction()
+    mock_db = MagicMock()
+    mock_cursor = AsyncMock()
+    
+    # 1. First fetch: alert_channel_id (returns 999)
+    # 2. Second fetch: wishlist status check (returns None/False)
+    mock_cursor.fetchone.side_effect = [[999], None]
+    mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
+    
+    mock_alert_channel = AsyncMock(spec=discord.TextChannel)
+    mock_alert_channel.id = 999
+    mock_alert_channel.mention = "<#999>"
+    
+    with (
+        MagicMock(spec=aiohttp.ClientSession) as mock_session,
+        pytest.MonkeyPatch().context() as mp
+    ):
+        mp.setattr(bot, 'session', mock_session)
+        mp.setattr(bot, 'db', mock_db)
+        # Mock bot.get_channel to return our fake alert channel
+        mp.setattr(bot, 'get_channel', MagicMock(return_value=mock_alert_channel))
+        
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json.side_effect = [MOCK_INSCRYPTION_SEARCH_RESULT, MOCK_INSCRYPTION_OVERVIEW_DATA, MOCK_INSCRYPTION_DEALS_DATA]
+        mock_session.request.return_value.__aenter__.return_value = mock_response
+
+        await deal_command.callback(mock_interaction, "Inscryption")
+
+        # Verify redirection occurred
+        mock_alert_channel.send.assert_called_once()
+        assert "sent the deals" in mock_interaction.original_response_content
+        assert mock_alert_channel.mention in mock_interaction.original_response_content
+
+@pytest.mark.asyncio
+async def test_set_alert_channel_admin_success():
+    mock_interaction = MockInteraction()
+    mock_interaction.user.guild_permissions.manage_guild = True
+    mock_channel = MagicMock(spec=discord.TextChannel)
+    mock_channel.id = 999
+    mock_channel.mention = "<#999>"
+    
+    mock_db = MagicMock()
+    mock_db.commit = AsyncMock()
+    mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(AsyncMock())
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(bot, 'db', mock_db)
+        await set_alert_channel.callback(mock_interaction, mock_channel)
+
+        assert mock_db.execute.call_count >= 1
+        args = mock_db.execute.call_args[0]
+        assert "INSERT OR REPLACE INTO guild_settings" in args[0]
+        assert args[1] == (mock_interaction.guild_id, 999)
+        mock_interaction.response.send_message.assert_called_once()
+        assert "Search results will now be sent" in mock_interaction.response.send_message.call_args[0][0]
+
+@pytest.mark.asyncio
+async def test_set_alert_channel_no_permission():
+    mock_interaction = MockInteraction()
+    mock_interaction.user.guild_permissions.manage_guild = False
+    mock_channel = MagicMock(spec=discord.TextChannel)
+    
+    await set_alert_channel.callback(mock_interaction, mock_channel)
+    
+    mock_interaction.response.send_message.assert_called_once()
+    assert "You need 'Manage Server' permissions" in mock_interaction.response.send_message.call_args[0][0]

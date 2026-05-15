@@ -448,6 +448,19 @@ class GameSelectView(discord.ui.View):
 async def show_deals(interaction, game_id, game_title, country, include_wishlist_buttons=True):
     """Fetches deals for a specific game ID and edits the original response with an embed."""
     logger.info(f"Fetching deals for '{game_title}' (ID: {game_id}) in region: {country}. Wishlist buttons: {include_wishlist_buttons}")
+    
+    # Check if we should redirect the reply to a designated alert channel
+    alert_channel = None
+    if interaction.guild_id:
+        async with bot.db.execute("SELECT alert_channel_id FROM guild_settings WHERE guild_id = ?", (interaction.guild_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0] != interaction.channel_id:
+                try:
+                    # Try to get channel from cache, fallback to fetching
+                    alert_channel = bot.get_channel(row[0]) or await bot.fetch_channel(row[0])
+                except Exception as e:
+                    logger.warning(f"Failed to resolve alert channel {row[0]} for guild {interaction.guild_id}: {e}")
+
     # Fetch historical low data from the Overview endpoint
     overview_response = await fetch_itad_data(
         bot.session,
@@ -556,6 +569,15 @@ async def show_deals(interaction, game_id, game_title, country, include_wishlist
             is_on_wishlist = await cursor.fetchone() is not None
         
         view = DealView(game_id, game_title, country, is_on_wishlist, interaction.guild_id)
+
+    # Send to alert channel if redirected, otherwise reply in-place
+    if alert_channel:
+        try:
+            await alert_channel.send(embed=embed, view=view)
+            await interaction.edit_original_response(content=f"✅ I've sent the deals for **{game_title}** to {alert_channel.mention}!", embed=None, view=None)
+            return
+        except discord.Forbidden:
+            logger.warning(f"Permission denied for alert channel {alert_channel.id}. Falling back to original channel.")
 
     await interaction.edit_original_response(content=None, embed=embed, view=view)
 
@@ -696,13 +718,30 @@ async def wishlist_list(interaction: discord.Interaction):
 
 @wishlist_group.command(name="remove", description="Remove a game from your wishlist")
 async def wishlist_remove(interaction: discord.Interaction, game_id: str):
-    # In a real app, you'd want an autocomplete here, but for now we delete by ID or title
-    await bot.db.execute("DELETE FROM wishlist WHERE user_id = ? AND (game_id = ? OR game_title = ?)", 
-                        (interaction.user.id, game_id, game_id))
+    # Use LOWER() for case-insensitive matching and check rowcount to confirm deletion
+    cursor = await bot.db.execute(
+        "DELETE FROM wishlist WHERE user_id = ? AND (LOWER(game_id) = LOWER(?) OR LOWER(game_title) = LOWER(?))",
+        (interaction.user.id, game_id, game_id)
+    )
     await bot.db.commit()
-    await interaction.response.send_message(f"Removed '{game_id}' from your wishlist.", ephemeral=True)
+    
+    if cursor.rowcount > 0:
+        await interaction.response.send_message(f"✅ Removed '{game_id}' from your wishlist.", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"❌ Could not find '{game_id}' in your wishlist. Please use the exact title (e.g., 'Inscryption') without the country suffix.",
+            ephemeral=True
+        )
+
+@wishlist_group.command(name="clear", description="Remove ALL games from your wishlist")
+async def wishlist_clear(interaction: discord.Interaction):
+    await bot.db.execute("DELETE FROM wishlist WHERE user_id = ?", (interaction.user.id,))
+    await bot.db.commit()
+    await interaction.response.send_message("✅ Your entire wishlist has been cleared.", ephemeral=True)
 
 @bot.tree.command(name="force_check", description="[Admin Only] Manually trigger a wishlist price check")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 async def force_check(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ You do not have permission to run this command.", ephemeral=True)
@@ -713,6 +752,24 @@ async def force_check(interaction: discord.Interaction):
     await bot.check_wishlists()
     
     await interaction.followup.send("✅ Manual wishlist check completed. Check logs for details.", ephemeral=True)
+
+@bot.tree.command(name="set_alert_channel", description="[Admin Only] Set the channel where search results are sent")
+@app_commands.describe(channel="The channel for deal results")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def set_alert_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.guild_id:
+        return await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("❌ You need 'Manage Server' permissions to do this!", ephemeral=True)
+        
+    await bot.db.execute(
+        "INSERT OR REPLACE INTO guild_settings (guild_id, alert_channel_id) VALUES (?, ?)",
+        (interaction.guild_id, channel.id)
+    )
+    await bot.db.commit()
+    await interaction.response.send_message(f"✅ Search results will now be sent to {channel.mention}.", ephemeral=True)
 
 if __name__ == "__main__":
     logger.info("=== Bot Startup Initiated ===")
