@@ -5,6 +5,7 @@ from main import fetch_itad_data, deal_command, GameSelectView, bot, wishlist_ad
 import discord
 import os
 import datetime
+import time
 from dotenv import load_dotenv
 
 @pytest.mark.asyncio
@@ -39,13 +40,13 @@ async def test_fetch_itad_data_unsupported_country():
 # --- Mock Data for ITAD API Responses ---
 
 MOCK_INSCRYPTION_SEARCH_RESULT = [
-    {"title": "Inscryption", "id": "inscryption"}
+    {"title": "Inscryption", "id": "018d937f-4610-7109-b250-072bf2e0d351", "slug": "inscryption"}
 ]
 
 MOCK_INSCRYPTION_OVERVIEW_DATA = {
     "prices": [
         {
-            "id": "inscryption",
+            "id": "018d937f-4610-7109-b250-072bf2e0d351",
             "lowest": {
                 "shop": {"name": "Steam"},
                 "price": {"amount": 5.99, "currency": "USD"}
@@ -63,7 +64,7 @@ MOCK_INSCRYPTION_OVERVIEW_DATA = {
 
 MOCK_INSCRYPTION_DEALS_DATA = [
     {
-        "id": "inscryption",
+        "id": "018d937f-4610-7109-b250-072bf2e0d351",
         "deals": [
             {
                 "shop": {"name": "Steam"},
@@ -84,13 +85,13 @@ MOCK_INSCRYPTION_DEALS_DATA = [
 ]
 
 MOCK_AC_ORIGINS_SEARCH_RESULT = [
-    {"title": "Assassin's Creed Origins", "id": "assassinscreedorigins"}
+    {"title": "Assassin's Creed Origins", "id": "aco-uuid-123", "slug": "assassinscreedorigins"}
 ]
 
 MOCK_AC_ORIGINS_OVERVIEW_DATA = {
     "prices": [
         {
-            "id": "assassinscreedorigins",
+            "id": "aco-uuid-123",
             "lowest": {
                 "shop": {"name": "Ubisoft Store"},
                 "price": {"amount": 11.99, "currency": "USD"}
@@ -106,7 +107,7 @@ MOCK_AC_ORIGINS_OVERVIEW_DATA = {
 
 MOCK_AC_ORIGINS_DEALS_DATA = [
     {
-        "id": "assassinscreedorigins",
+        "id": "aco-uuid-123",
         "deals": [
             {
                 "shop": {"name": "Ubisoft Store"},
@@ -127,9 +128,9 @@ MOCK_AC_ORIGINS_DEALS_DATA = [
 ]
 
 MOCK_AC_SERIES_SEARCH_RESULTS = [
-    {"title": "Assassin's Creed Origins", "id": "assassinscreedorigins"},
-    {"title": "Assassin's Creed Odyssey", "id": "assassinscreedodyssey"},
-    {"title": "Assassin's Creed Valhalla", "id": "assassinscreedvalhalla"}
+    {"title": "Assassin's Creed Origins", "id": "aco-uuid-123", "slug": "assassinscreedorigins"},
+    {"title": "Assassin's Creed Odyssey", "id": "acod-uuid-456", "slug": "assassinscreedodyssey"},
+    {"title": "Assassin's Creed Valhalla", "id": "acv-uuid-789", "slug": "assassinscreedvalhalla"}
 ]
 
 class MockAiosqliteExecute:
@@ -217,6 +218,7 @@ async def test_itadbot_single_game_search_inscryption():
         embed = mock_interaction.original_response_embed
         assert embed is not None
         assert "Inscryption" in embed.title
+        assert embed.url == "https://isthereanydeal.com/game/inscryption/info/"
         assert "12345.jpg" in embed.image.url
         assert "Historical Low" in embed.description
         assert "GOG" in embed.fields[2].name
@@ -225,6 +227,7 @@ async def test_itadbot_single_game_search_inscryption():
         # Verify DealView is attached
         assert isinstance(mock_interaction.original_response_view, DealView)
         assert mock_interaction.original_response_view.is_on_wishlist is False
+        assert mock_interaction.original_response_view.top_deal['shop']['name'] == "Steam"
 
 @pytest.mark.asyncio
 async def test_itadbot_game_in_series_search_ac_origins():
@@ -256,6 +259,7 @@ async def test_itadbot_game_in_series_search_ac_origins():
         embed = mock_interaction.original_response_embed
         assert embed is not None
         assert "Assassin's Creed Origins" in embed.title
+        assert embed.url == "https://isthereanydeal.com/game/assassinscreedorigins/info/"
         assert "67890.jpg" in embed.image.url
         assert "Historical Low" in embed.description
         assert "Ubisoft Store" in embed.fields[1].name
@@ -291,7 +295,7 @@ async def test_wishlist_add_single_result():
         assert mock_db.execute.call_count >= 1
         args = mock_db.execute.call_args[0]
         assert "INSERT OR REPLACE INTO wishlist" in args[0]
-        assert args[1] == (mock_interaction.user.id, "inscryption", "Inscryption", "US", "dm", None, None)
+        assert args[1] == (mock_interaction.user.id, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "dm", None, None)
         
         mock_interaction.followup.send.assert_called_once_with(
             "✅ Added **Inscryption** (US) to your wishlist! I'll DM you when it goes on sale."
@@ -372,7 +376,7 @@ async def test_game_select_view_add_to_wishlist():
         view = GameSelectView(MOCK_AC_SERIES_SEARCH_RESULTS, mock_interaction.user, "US", action="add", alert_method="mention")
         
         with patch.object(type(view.select), 'values', new_callable=PropertyMock) as mock_values:
-            mock_values.return_value = ["assassinscreedorigins"]
+            mock_values.return_value = ["aco-uuid-123"]
             await view.select_callback(mock_interaction)
 
         # Check DB update for specific game selection
@@ -380,7 +384,7 @@ async def test_game_select_view_add_to_wishlist():
         assert mock_db.execute.call_count >= 1
         args = mock_db.execute.call_args[0]
         assert "INSERT OR REPLACE INTO wishlist" in args[0]
-        assert "assassinscreedorigins" in args[1]
+        assert "aco-uuid-123" in args[1]
         mock_interaction.response.edit_message.assert_called_once()
 
 @pytest.mark.asyncio
@@ -436,7 +440,7 @@ async def test_itadbot_series_selection_leads_to_deals():
         
         # Mock the 'values' property of the select menu
         with patch.object(type(sent_view.select), 'values', new_callable=PropertyMock) as mock_values:
-            mock_values.return_value = ["assassinscreedorigins"]
+            mock_values.return_value = ["aco-uuid-123"]
             # Manually call the select_callback to simulate user interaction
             await sent_view.select_callback(mock_interaction)
 
@@ -445,11 +449,13 @@ async def test_itadbot_series_selection_leads_to_deals():
         embed = mock_interaction.original_response_embed
         assert embed is not None
         assert "Assassin's Creed Origins" in embed.title
+        assert embed.url == "https://isthereanydeal.com/game/assassinscreedorigins/info/"
         assert "67890.jpg" in embed.image.url
         assert "Historical Low" in embed.description
         assert "Ubisoft Store" in embed.fields[1].name
         assert "$11.99" in embed.fields[1].value
         assert isinstance(mock_interaction.original_response_view, DealView)
+
 
 @pytest.mark.asyncio
 async def test_check_wishlists_sends_alerts():
@@ -465,8 +471,8 @@ async def test_check_wishlists_sends_alerts():
     mock_cursor = AsyncMock()
     # 10 columns: user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed
     mock_cursor.fetchall.return_value = [
-        (123, "inscryption", "Inscryption", "US", "dm", None, None, None, 0, 0),
-        (456, "inscryption", "Inscryption", "US", "mention", 777, 789, None, 0, 0)
+        (123, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "dm", None, None, None, 0, 0),
+        (456, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "mention", 777, 789, None, 0, 0)
     ]
     mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
 
@@ -512,7 +518,7 @@ async def test_check_wishlists_sends_final_call_alert():
     mock_cursor = AsyncMock()
     # user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed
     mock_cursor.fetchall.return_value = [
-        (123, "inscryption", "Inscryption", "US", "dm", None, None, deal_url, 1, 0)
+        (123, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "dm", None, None, deal_url, 1, 0)
     ]
     mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
 
@@ -584,11 +590,20 @@ async def test_deal_view_add_dm():
 
     with pytest.MonkeyPatch().context() as mp:
         mp.setattr(bot, 'db', mock_db)
+        mock_deal = {
+            'url': 'https://store.steampowered.com/app/1062520/Inscryption/',
+            'shop': {'name': 'Steam'},
+            'price': {'amount': 19.99, 'currency': 'USD'},
+            'cut': 0
+        }
         # Initially not on wishlist
-        view = DealView("inscryption", "Inscryption", "US", is_on_wishlist=False, guild_id=None)
+        view = DealView("018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", is_on_wishlist=False, guild_id=None, top_deal=mock_deal)
         
         # Trigger callback
         await view.add_dm_callback(mock_interaction)
+        
+        # Verify follow-up confirmation sent
+        mock_interaction.followup.send.assert_called_once()
         
         # Verify DB insertion
         assert mock_db.execute.call_count >= 1
@@ -596,9 +611,49 @@ async def test_deal_view_add_dm():
         assert "INSERT OR REPLACE INTO wishlist" in args[0]
         assert "dm" in args[1]
         
+        # Verify UUID and alert_state are correct
+        # Indices based on: user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed
+        assert args[1][1] == "018d937f-4610-7109-b250-072bf2e0d351"
+        assert args[1][7] == mock_deal['url']
+        assert args[1][8] == 1 
+        
         assert view.is_on_wishlist is True
         mock_interaction.response.edit_message.assert_called_once()
-        mock_interaction.followup.send.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_deal_view_add_expiring_soon():
+    mock_interaction = MockInteraction()
+    mock_db = MagicMock()
+    mock_db.commit = AsyncMock()
+    mock_cursor = AsyncMock()
+    mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
+    
+    # Mock a deal expiring in 1 hour
+    expiry_time = int(time.time()) + 3600
+    mock_deal = {
+        'url': 'https://store.steampowered.com/app/1062520/Inscryption/',
+        'shop': {'name': 'Steam'},
+        'price': {'amount': 5.00, 'currency': 'USD'},
+        'cut': 75,
+        'expiry': expiry_time
+    }
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(bot, 'db', mock_db)
+        view = DealView("018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", is_on_wishlist=False, top_deal=mock_deal)
+        
+        await view.add_dm_callback(mock_interaction)
+        
+        # Verify DB insertion has alert_state=2 (Expiring)
+        args = mock_db.execute.call_args[0]
+        assert args[1][8] == 2
+        
+        # Verify an immediate "Final Call" DM was sent to the user
+        # One for confirmation (followup), one for the actual alert (user.send)
+        mock_interaction.user.send.assert_called_once()
+        sent_msg = mock_interaction.user.send.call_args[0][0]
+        assert "Final Call!" in sent_msg
+        assert "$5.00" in sent_msg
 
 @pytest.mark.asyncio
 async def test_wishlist_remove_success():
@@ -688,8 +743,14 @@ async def test_deal_view_add_mention():
 
     with pytest.MonkeyPatch().context() as mp:
         mp.setattr(bot, 'db', mock_db)
-        view = DealView("inscryption", "Inscryption", "US", is_on_wishlist=False, guild_id=456)
-        
+        mock_deal = {
+            'url': 'https://store.steampowered.com/app/1062520/Inscryption/',
+            'shop': {'name': 'Steam'},
+            'price': {'amount': 19.99, 'currency': 'USD'},
+            'cut': 0
+        }
+        view = DealView("018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", is_on_wishlist=False, guild_id=456, top_deal=mock_deal)
+
         await view.add_mention_callback(mock_interaction)
         
         # Verify DB insertion contains mention info
@@ -700,6 +761,7 @@ async def test_deal_view_add_mention():
         insert_call = mock_db.execute.call_args_list[1]
         insert_args = insert_call[0]
         assert "mention" in insert_args[1]
+        assert insert_args[1][8] == 1 # alert_state
         assert 999 in insert_args[1] # channel_id
         
         assert view.is_on_wishlist is True
@@ -716,7 +778,7 @@ async def test_deal_view_remove():
     with pytest.MonkeyPatch().context() as mp:
         mp.setattr(bot, 'db', mock_db)
         # Initially on wishlist
-        view = DealView("inscryption", "Inscryption", "US", is_on_wishlist=True)
+        view = DealView("018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", is_on_wishlist=True)
         
         await view.remove_callback(mock_interaction)
         
@@ -724,7 +786,7 @@ async def test_deal_view_remove():
         assert mock_db.execute.call_count >= 1
         args = mock_db.execute.call_args[0]
         assert "DELETE FROM wishlist" in args[0]
-        assert "inscryption" in args[1]
+        assert "018d937f-4610-7109-b250-072bf2e0d351" in args[1]
         
         assert view.is_on_wishlist is False
         mock_interaction.response.edit_message.assert_called_once()

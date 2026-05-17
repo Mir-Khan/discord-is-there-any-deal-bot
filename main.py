@@ -236,7 +236,7 @@ class ITADBot(commands.Bot):
                     await self.db.commit() # Commit updates for this game's watchers
 
                     # Construct the notification message
-                    price = f"{CURRENCY_SYMBOLS.get(top_deal['price']['currency'], '')}{top_deal['price']['amount']}"
+                    price = f"{CURRENCY_SYMBOLS.get(top_deal['price']['currency'], '')}{top_deal['price']['amount']:.2f}"
                     prefix = "🔔 **New Deal Alert!**" if not is_expiring else "⏳ **Final Call! Deal Expiring Soon:**"
                     msg = f"{prefix}\n'{title}' is currently **{price}** ({top_deal['cut']}% off) at {top_deal['shop']['name']}.\nLink: {top_deal['url']}"
                     view = WishlistActionView(game_id, title)
@@ -302,13 +302,14 @@ class WishlistActionView(discord.ui.View):
 
 class DealView(discord.ui.View):
     """Buttons attached to deal search results for quick wishlist management."""
-    def __init__(self, game_id, game_title, country, is_on_wishlist, guild_id=None):
+    def __init__(self, game_id, game_title, country, is_on_wishlist, guild_id=None, top_deal=None):
         super().__init__(timeout=120)
         self.game_id = game_id
         self.game_title = game_title
         self.country = country
         self.is_on_wishlist = is_on_wishlist
         self.guild_id = guild_id
+        self.top_deal = top_deal
         self._update_buttons()
 
     def _update_buttons(self):
@@ -331,11 +332,32 @@ class DealView(discord.ui.View):
             self.add_item(btn_rem)
 
     async def add_dm_callback(self, interaction: discord.Interaction):
+        deal_url = self.top_deal['url'] if self.top_deal else None
+        expiry = self.top_deal.get('expiry') if self.top_deal else None
+        alert_state = 1 if deal_url else 0
+        
+        is_expiring_soon = False
+        if self.top_deal and expiry:
+            try:
+                if (int(expiry) - int(time.time())) < 28800:
+                    alert_state = 2
+                    is_expiring_soon = True
+            except (ValueError, TypeError): pass
+
         await bot.db.execute(
-            "INSERT OR REPLACE INTO wishlist (user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, 0)",
-            (interaction.user.id, self.game_id, self.game_title, self.country, 'dm', None, None)
+            "INSERT OR REPLACE INTO wishlist (user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (interaction.user.id, self.game_id, self.game_title, self.country, 'dm', None, None, deal_url, alert_state)
         )
         await bot.db.commit()
+
+        if is_expiring_soon:
+            price = f"{CURRENCY_SYMBOLS.get(self.top_deal['price']['currency'], '')}{self.top_deal['price']['amount']:.2f}"
+            msg = f"⏳ **Final Call! Deal Expiring Soon:**\n'{self.game_title}' is currently **{price}** ({self.top_deal['cut']}% off) at {self.top_deal['shop']['name']}.\nLink: {self.top_deal['url']}"
+            try:
+                await interaction.user.send(msg, view=WishlistActionView(self.game_id, self.game_title))
+            except Exception as e:
+                logger.warning(f"Could not send immediate expiry DM: {e}")
+
         self.is_on_wishlist = True
         self._update_buttons()
         await interaction.response.edit_message(view=self)
@@ -346,11 +368,34 @@ class DealView(discord.ui.View):
             row = await cursor.fetchone()
             channel_id = row[0] if row else interaction.channel_id
 
+        deal_url = self.top_deal['url'] if self.top_deal else None
+        expiry = self.top_deal.get('expiry') if self.top_deal else None
+        alert_state = 1 if deal_url else 0
+        
+        is_expiring_soon = False
+        if self.top_deal and expiry:
+            try:
+                if (int(expiry) - int(time.time())) < 28800:
+                    alert_state = 2
+                    is_expiring_soon = True
+            except (ValueError, TypeError): pass
+
         await bot.db.execute(
-            "INSERT OR REPLACE INTO wishlist (user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, 0)",
-            (interaction.user.id, self.game_id, self.game_title, self.country, 'mention', interaction.guild_id, channel_id)
+            "INSERT OR REPLACE INTO wishlist (user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (interaction.user.id, self.game_id, self.game_title, self.country, 'mention', interaction.guild_id, channel_id, deal_url, alert_state)
         )
         await bot.db.commit()
+
+        if is_expiring_soon:
+            price = f"{CURRENCY_SYMBOLS.get(self.top_deal['price']['currency'], '')}{self.top_deal['price']['amount']:.2f}"
+            msg = f"⏳ **Final Call! Deal Expiring Soon:**\n'{self.game_title}' is currently **{price}** ({self.top_deal['cut']}% off) at {self.top_deal['shop']['name']}.\nLink: {self.top_deal['url']}"
+            try:
+                channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+                if channel:
+                    await channel.send(content=f"<@{interaction.user.id}> {msg}", view=WishlistActionView(self.game_id, self.game_title))
+            except Exception as e:
+                logger.warning(f"Could not send immediate expiry mention: {e}")
+
         self.is_on_wishlist = True
         self._update_buttons()
         await interaction.response.edit_message(view=self)
@@ -407,6 +452,7 @@ class GameSelectView(discord.ui.View):
         self.country = country
         self.action = action # "show" (deals) or "add" (wishlist)
         self.alert_method = alert_method
+        self.games = games
         options = [
             discord.SelectOption(label=g['title'], value=g['id'], description=f"ID: {g['id']}")
             for g in games[:25] # Discord limits select menus to 25 options
@@ -420,7 +466,12 @@ class GameSelectView(discord.ui.View):
             return await interaction.response.send_message("This isn't your search!", ephemeral=True)
         
         game_id = self.select.values[0]
-        game_title = next(o.label for o in self.select.options if o.value == game_id)
+        game_obj = next((g for g in self.games if g['id'] == game_id), None)
+        if not game_obj:
+            return await interaction.response.send_message("Could not find game details.", ephemeral=True)
+            
+        game_title = game_obj['title']
+        slug = game_obj.get('slug')
         
         if self.action == "add":
             guild_id = interaction.guild_id if self.alert_method == "mention" else None
@@ -443,9 +494,9 @@ class GameSelectView(discord.ui.View):
             return await interaction.response.edit_message(content=msg, view=None)
         
         await interaction.response.defer()
-        await show_deals(interaction, game_id, game_title, self.country, include_wishlist_buttons=True)
+        await show_deals(interaction, game_id, game_title, self.country, include_wishlist_buttons=True, slug=slug)
 
-async def show_deals(interaction, game_id, game_title, country, include_wishlist_buttons=True):
+async def show_deals(interaction, game_id, game_title, country, include_wishlist_buttons=True, slug=None):
     """Fetches deals for a specific game ID and edits the original response with an embed."""
     logger.info(f"Fetching deals for '{game_title}' (ID: {game_id}) in region: {country}. Wishlist buttons: {include_wishlist_buttons}")
     
@@ -532,7 +583,7 @@ async def show_deals(interaction, game_id, game_title, country, include_wishlist
 
     embed = discord.Embed(
         title=game_title,
-        url=f"https://isthereanydeal.com/game/{game_id}/info/",
+        url=f"https://isthereanydeal.com/game/{slug or game_id}/info/",
         description=f"📉 **Historical Low:** {historical_low_str}\n🎁 **Bundles:** {bundle_val}",
         color=0x2ecc71, # Vibrant Emerald Green
         timestamp=interaction.created_at
@@ -568,7 +619,7 @@ async def show_deals(interaction, game_id, game_title, country, include_wishlist
         async with bot.db.execute("SELECT 1 FROM wishlist WHERE user_id = ? AND game_id = ?", (interaction.user.id, game_id)) as cursor:
             is_on_wishlist = await cursor.fetchone() is not None
         
-        view = DealView(game_id, game_title, country, is_on_wishlist, interaction.guild_id)
+        view = DealView(game_id, game_title, country, is_on_wishlist, interaction.guild_id, top_deal=deals[0])
 
     # Send to alert channel if redirected, otherwise reply in-place
     if alert_channel:
@@ -608,7 +659,7 @@ async def deal_command(interaction: discord.Interaction, game_name: str, country
         # 2. Handle multiple results
         if len(search_results) == 1:
             game = search_results[0]
-            await show_deals(interaction, game['id'], game['title'], country)
+            await show_deals(interaction, game['id'], game['title'], country, slug=game.get('slug'))
         else:
             view = GameSelectView(search_results, interaction.user, country)
             await interaction.followup.send(
