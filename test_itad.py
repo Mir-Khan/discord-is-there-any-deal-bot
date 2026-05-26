@@ -212,7 +212,7 @@ async def test_itadbot_single_game_search_inscryption():
         await deal_command.callback(mock_interaction, "Inscryption")
 
         # Assertions
-        mock_interaction.response.defer.assert_called_once()
+        mock_interaction.response.defer.assert_called_once_with(ephemeral=True)
         mock_interaction.response.edit_original_response.assert_called_once()
         
         embed = mock_interaction.original_response_embed
@@ -227,6 +227,7 @@ async def test_itadbot_single_game_search_inscryption():
         # Verify DealView is attached
         assert isinstance(mock_interaction.original_response_view, DealView)
         assert mock_interaction.original_response_view.is_on_wishlist is False
+        assert mock_interaction.original_response_view.owner_id == mock_interaction.user.id
         assert mock_interaction.original_response_view.top_deal['shop']['name'] == "Steam"
 
 @pytest.mark.asyncio
@@ -253,7 +254,7 @@ async def test_itadbot_game_in_series_search_ac_origins():
         await deal_command.callback(mock_interaction, "Assassin's Creed: Origins")
 
         # Assertions
-        mock_interaction.response.defer.assert_called_once()
+        mock_interaction.response.defer.assert_called_once_with(ephemeral=True)
         mock_interaction.response.edit_original_response.assert_called_once()
         
         embed = mock_interaction.original_response_embed
@@ -404,7 +405,7 @@ async def test_itadbot_series_search_presents_selection():
         await deal_command.callback(mock_interaction, "Assassin's Creed")
 
         # Assertions
-        mock_interaction.response.defer.assert_called_once()
+        mock_interaction.response.defer.assert_called_once_with(ephemeral=True)
         mock_interaction.followup.send.assert_called_once()
         
         # Check that a GameSelectView was sent
@@ -479,7 +480,18 @@ async def test_check_wishlists_sends_alerts():
     # Mock fetch_itad_data to return deal data
     mock_response_itad = AsyncMock()
     mock_response_itad.status = 200
-    mock_response_itad.json.return_value = MOCK_INSCRYPTION_DEALS_DATA
+    # Create a copy and ensure the top deal is an actual sale below MSRP
+    sale_data = [MOCK_INSCRYPTION_DEALS_DATA[0].copy()]
+    sale_data[0]['deals'] = [
+        {
+            "shop": {"name": "GOG"},
+            "price": {"amount": 14.99, "currency": "USD"},
+            "regular": {"amount": 19.99, "currency": "USD"},
+            "cut": 25,
+            "url": "https://www.gog.com/game/inscryption"
+        }
+    ]
+    mock_response_itad.json.return_value = sale_data
     mock_session.request.return_value.__aenter__.return_value = mock_response_itad
 
     with pytest.MonkeyPatch().context() as mp:
@@ -504,6 +516,50 @@ async def test_check_wishlists_sends_alerts():
         assert "Deal Alert!" in sent_msg
 
 @pytest.mark.asyncio
+async def test_check_wishlists_skips_fake_sale():
+    """Test that a sale is ignored if the price is still higher than Market MSRP."""
+    mock_db = MagicMock()
+    mock_session = MagicMock(spec=aiohttp.ClientSession)
+    mock_user = AsyncMock()
+
+    # 1. Mock DB SELECT: User 123 watches "Forza"
+    mock_cursor = AsyncMock()
+    mock_cursor.fetchall.return_value = [
+        (123, "forza-id", "Forza Horizon 6", "US", "dm", None, None, None, 0, 0)
+    ]
+    mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
+
+    # 2. Mock ITAD response with a "sale" (72.58) that is higher than the US MSRP (69.99)
+    mock_response_itad = AsyncMock()
+    mock_response_itad.status = 200
+    mock_response_itad.json.return_value = [{
+        "id": "forza-id",
+        "deals": [
+            {
+                "shop": {"name": "GamesPlanet UK"},
+                "price": {"amount": 72.58, "currency": "USD"},
+                "regular": {"amount": 80.65, "currency": "USD"},
+                "url": "https://uk.gamesplanet.com/game/forza"
+            },
+            {
+                "shop": {"name": "Microsoft Store"},
+                "price": {"amount": 69.99, "currency": "USD"},
+                "regular": {"amount": 69.99, "currency": "USD"},
+                "url": "https://xbox.com/forza"
+            }
+        ]
+    }]
+    mock_session.request.return_value.__aenter__.return_value = mock_response_itad
+
+    with (pytest.MonkeyPatch().context() as mp, patch("main.bot.fetch_user", AsyncMock(return_value=mock_user))):
+        mp.setattr(bot, 'db', mock_db)
+        mp.setattr(bot, 'session', mock_session)
+        await bot.check_wishlists()
+
+        # Alert should NOT be sent because the top price is >= Market MSRP
+        mock_user.send.assert_not_called()
+
+@pytest.mark.asyncio
 async def test_check_wishlists_sends_final_call_alert():
     mock_db = MagicMock()
     mock_db.commit = AsyncMock()
@@ -524,9 +580,16 @@ async def test_check_wishlists_sends_final_call_alert():
 
     mock_response_itad = AsyncMock()
     mock_response_itad.status = 200
-    # Inject expiry into the mock data
+    # Inject expiry and ensure it's a sale price relative to MSRP
     expiring_data = [MOCK_INSCRYPTION_DEALS_DATA[0].copy()]
-    expiring_data[0]['deals'][0]['expiry'] = expiry_time
+    expiring_data[0]['deals'] = [{
+        "shop": {"name": "GOG"},
+        "price": {"amount": 14.99, "currency": "USD"},
+        "regular": {"amount": 19.99, "currency": "USD"},
+        "cut": 25,
+        "url": deal_url,
+        "expiry": expiry_time
+    }]
     mock_response_itad.json.return_value = expiring_data
     mock_session.request.return_value.__aenter__.return_value = mock_response_itad
 
@@ -577,7 +640,7 @@ async def test_itadbot_without_wishlist_buttons():
         mock_session.request.return_value.__aenter__.return_value = mock_response
 
         await deal_command.callback(mock_interaction, "Inscryption", wishlist_buttons=False)
-
+        mock_interaction.response.defer.assert_called_once_with(ephemeral=True)
         assert mock_interaction.original_response_view is None
 
 @pytest.mark.asyncio
@@ -791,6 +854,30 @@ async def test_deal_view_remove():
         assert view.is_on_wishlist is False
         mock_interaction.response.edit_message.assert_called_once()
         mock_interaction.followup.send.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_deal_view_interaction_check_security():
+    """Test that users cannot interact with other users' search result buttons."""
+    # View owned by user 123
+    view = DealView("id", "Title", "US", False, owner_id=123)
+    
+    # Interaction from user 456
+    mock_interaction = MockInteraction(user_id=456)
+    
+    result = await view.interaction_check(mock_interaction)
+    assert result is False
+    mock_interaction.response.send_message.assert_called_once()
+    assert "ephemeral" in mock_interaction.response.send_message.call_args.kwargs
+    assert mock_interaction.response.send_message.call_args.kwargs["ephemeral"] is True
+
+@pytest.mark.asyncio
+async def test_deal_view_interaction_check_success():
+    """Test that the owner can successfully interact with their search result buttons."""
+    view = DealView("id", "Title", "US", False, owner_id=123)
+    mock_interaction = MockInteraction(user_id=123)
+    
+    result = await view.interaction_check(mock_interaction)
+    assert result is True
 
 @pytest.mark.asyncio
 async def test_deal_command_redirection():

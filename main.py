@@ -189,6 +189,15 @@ class ITADBot(commands.Bot):
 
                     top_deal = deals[0]
                     deal_url, expiry = top_deal['url'], top_deal.get('expiry')
+                    
+                    # Calculate "Market MSRP" - the lowest regular price across all shops.
+                    # This prevents alerts for "sales" that are more expensive than regular prices elsewhere.
+                    market_msrp = min((d['regular']['amount'] for d in deals if d.get('regular')), default=top_deal['regular']['amount'])
+                    
+                    if top_deal['price']['amount'] >= market_msrp:
+                        logger.info(f"Skipping alert for {game_id}: Sale price ({top_deal['price']['amount']}) is not lower than Market MSRP ({market_msrp}).")
+                        continue
+
                     # Ensure expiry is an int for subtraction logic
                     if expiry is not None:
                         try:
@@ -302,7 +311,7 @@ class WishlistActionView(discord.ui.View):
 
 class DealView(discord.ui.View):
     """Buttons attached to deal search results for quick wishlist management."""
-    def __init__(self, game_id, game_title, country, is_on_wishlist, guild_id=None, top_deal=None):
+    def __init__(self, game_id, game_title, country, is_on_wishlist, guild_id=None, top_deal=None, owner_id=None):
         super().__init__(timeout=120)
         self.game_id = game_id
         self.game_title = game_title
@@ -310,7 +319,14 @@ class DealView(discord.ui.View):
         self.is_on_wishlist = is_on_wishlist
         self.guild_id = guild_id
         self.top_deal = top_deal
+        self.owner_id = owner_id
         self._update_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.owner_id and interaction.user.id != self.owner_id:
+            await interaction.response.send_message("You didn't perform this search. Use `/deal` to manage your own wishlist!", ephemeral=True)
+            return False
+        return True
 
     def _update_buttons(self):
         self.clear_items()
@@ -600,7 +616,9 @@ async def show_deals(interaction, game_id, game_title, country, include_wishlist
         currency_code = deal['price'].get('currency', 'USD')
         currency_symbol = CURRENCY_SYMBOLS.get(currency_code, currency_code)
         current_price = f"{currency_symbol}{deal['price']['amount']:.2f}"
-        regular_price = f"{currency_symbol}{deal['regular']['amount']:.2f}"
+        
+        regular_amount = deal.get('regular', {}).get('amount', deal['price']['amount'])
+        regular_price = f"{currency_symbol}{regular_amount:.2f}"
         
         # Added: Platform/DRM info (e.g., Steam, GOG, Epic)
         platform = f" ({deal['drm'][0]['name']})" if deal.get('drm') else ""
@@ -619,7 +637,7 @@ async def show_deals(interaction, game_id, game_title, country, include_wishlist
         async with bot.db.execute("SELECT 1 FROM wishlist WHERE user_id = ? AND game_id = ?", (interaction.user.id, game_id)) as cursor:
             is_on_wishlist = await cursor.fetchone() is not None
         
-        view = DealView(game_id, game_title, country, is_on_wishlist, interaction.guild_id, top_deal=deals[0])
+        view = DealView(game_id, game_title, country, is_on_wishlist, interaction.guild_id, top_deal=deals[0], owner_id=interaction.user.id)
 
     # Send to alert channel if redirected, otherwise reply in-place
     if alert_channel:
@@ -648,7 +666,7 @@ async def show_deals(interaction, game_id, game_title, country, include_wishlist
 @app_commands.describe(wishlist_buttons="Whether to show 'Add to Wishlist' buttons on results")
 async def deal_command(interaction: discord.Interaction, game_name: str, country: str = "US", wishlist_buttons: bool = True):
     try:
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         # 1. Search for the game
         search_results = await fetch_itad_data(bot.session, "games/search/v1", {"title": game_name})
