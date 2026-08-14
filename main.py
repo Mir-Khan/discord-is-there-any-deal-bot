@@ -6,6 +6,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name
 logger = logging.getLogger('itad_bot')
 logger.info("Python process started. Initializing imports...")
 
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -30,6 +31,35 @@ CURRENCY_SYMBOLS = {
     "CAD": "C$",
     "AUD": "A$",
     "JPY": "¥"
+}
+
+# ITAD country codes map to currencies for NEXARDA, which prices by currency rather than country.
+COUNTRY_CURRENCY = {
+    "US": "USD",
+    "GB": "GBP",
+    "CA": "CAD",
+    "AU": "AUD",
+    "DE": "EUR",
+    "FR": "EUR",
+}
+
+def country_to_currency(country):
+    return COUNTRY_CURRENCY.get(country, "USD")
+
+# NEXARDA reports console offers under generic family names rather than per-generation
+# (e.g. no distinction between PS4/PS5 or Xbox One/Series X|S), so we track at the family level.
+NEXARDA_PLATFORMS = ["playstation", "xbox", "nintendo"]
+# Cap concurrent NEXARDA requests during the wishlist scan so a large wishlist doesn't hammer the API.
+NEXARDA_CHECK_CONCURRENCY = 8
+NEXARDA_OFFER_PLATFORM_TAGS = {
+    "playstation": {"PlayStation"},
+    "xbox": {"Xbox", "Xbox Play Anywhere"},
+    "nintendo": {"Nintendo"},
+}
+NEXARDA_SEARCH_PLATFORM_SLUGS = {
+    "playstation": {"playstation"},
+    "xbox": {"xbox", "xbox-play-anywhere"},
+    "nintendo": {"nintendo"},
 }
 
 class ITADBot(commands.Bot):
@@ -61,6 +91,8 @@ class ITADBot(commands.Bot):
                 alert_state INTEGER DEFAULT 0, -- 0: None, 1: First Sent, 2: Expiry Sent
                 is_snoozed INTEGER DEFAULT 0,
                 platform TEXT DEFAULT 'pc',
+                min_discount_percent INTEGER DEFAULT 0,
+                max_price REAL DEFAULT NULL,
                 PRIMARY KEY (user_id, game_id)
             )
         """)
@@ -82,6 +114,16 @@ class ITADBot(commands.Bot):
                 await self.db.execute("ALTER TABLE wishlist ADD COLUMN is_snoozed INTEGER DEFAULT 0")
             if "platform" not in columns:
                 await self.db.execute("ALTER TABLE wishlist ADD COLUMN platform TEXT DEFAULT 'pc'")
+            if "min_discount_percent" not in columns:
+                await self.db.execute("ALTER TABLE wishlist ADD COLUMN min_discount_percent INTEGER DEFAULT 0")
+            if "max_price" not in columns:
+                await self.db.execute("ALTER TABLE wishlist ADD COLUMN max_price REAL DEFAULT NULL")
+
+        # Migration: collapse old generation-specific console platform values into the
+        # family-level values NEXARDA's price data actually supports (ps4/ps5 -> playstation, etc).
+        await self.db.execute("UPDATE wishlist SET platform = 'playstation' WHERE platform IN ('ps4', 'ps5')")
+        await self.db.execute("UPDATE wishlist SET platform = 'xbox' WHERE platform IN ('xboxone', 'xboxseries')")
+        await self.db.execute("UPDATE wishlist SET platform = 'nintendo' WHERE platform = 'switch'")
 
         await self.db.commit()
 
@@ -140,19 +182,20 @@ class ITADBot(commands.Bot):
             logger.warning("Skipping wishlist check: DB or session not initialized.")
             return
 
-        logger.info("Running periodic wishlist price check...")
-        
-        # 1. Fetch all wishlist items once and group them by country and game_id
-        all_wishlist_items = {} 
-        
-        # Ensure the bot's database connection is open before trying to use it
-        if not self.db:
-            logger.error("Database connection is not established. Cannot run wishlist check.")
-            return
+        # tasks.loop permanently stops rescheduling itself if the wrapped coroutine ever raises,
+        # so any unexpected error (bad API response, network blip) must not escape this method.
+        try:
+            await self._run_wishlist_check()
+        except Exception:
+            logger.exception("Unhandled error during wishlist check; will retry on next scheduled run.")
 
-        # Fetch all wishlist items
+    async def _run_wishlist_check(self):
+        logger.info("Running periodic wishlist price check...")
+
+        # 1. Fetch all wishlist items once and group them by platform, country, and game_id
+        all_wishlist_items = {}
         async with self.db.execute(
-            "SELECT user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed, platform FROM wishlist"
+            "SELECT user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed, platform, min_discount_percent, max_price FROM wishlist"
         ) as cursor:
             for item in await cursor.fetchall():
                 platform, country, game_id = item[10], item[3], item[1]
@@ -164,30 +207,52 @@ class ITADBot(commands.Bot):
 
         now = int(time.time())
 
-        # 1. Process PC Deals (ITAD)
+        # 1. Process PC Deals (ITAD) - one batched request per country
         pc_items = all_wishlist_items.get('pc', {})
         for country, games_in_country in pc_items.items():
             game_ids = list(games_in_country.keys())
-            response = await fetch_itad_data(
-                self.session, "games/prices/v2", 
-                params={"country": country, "nondeals": 0, "vouchers": 1}, 
-                method='POST', json_data=game_ids
-            )
+            try:
+                response = await fetch_itad_data(
+                    self.session, "games/prices/v2",
+                    params={"country": country, "nondeals": 0, "vouchers": 1},
+                    method='POST', json_data=game_ids
+                )
+            except Exception:
+                logger.exception(f"Failed to fetch ITAD prices for country {country}; skipping this batch.")
+                continue
             if response:
                 for game_result in response:
-                    await self.process_itad_alert(game_result, games_in_country, now)
+                    try:
+                        await self.process_itad_alert(game_result, games_in_country, now)
+                    except Exception:
+                        logger.exception(f"Failed to process ITAD alert for game {game_result.get('id')}; skipping.")
 
-        # 2. Process Console Deals (NEXARDA)
-        for plat in ['ps4', 'ps5', 'xboxone', 'xboxseries', 'switch']:
-            plat_items = all_wishlist_items.get(plat, {})
-            for country, games_in_country in plat_items.items():
-                for game_id, watchers in games_in_country.items():
-                    # NEXARDA prices endpoint
-                    price_data = await fetch_nexarda_data(self.session, "prices", {"type": "id", "id": game_id})
-                    if price_data and price_data.get('results'):
-                        # Get base details for MSRP/Regular price
-                        details = await fetch_nexarda_data(self.session, "details", {"type": "id", "id": game_id})
-                        await self.process_nexarda_alert(price_data['results'], details, watchers, now)
+        # 2. Process Console Deals (NEXARDA) - one request per game, run concurrently with a capped pool
+        # since there's no batch endpoint for prices.
+        console_jobs = [
+            (plat, country, game_id, watchers)
+            for plat in NEXARDA_PLATFORMS
+            for country, games_in_country in all_wishlist_items.get(plat, {}).items()
+            for game_id, watchers in games_in_country.items()
+        ]
+
+        if console_jobs:
+            semaphore = asyncio.Semaphore(NEXARDA_CHECK_CONCURRENCY)
+
+            async def check_one(plat, country, game_id, watchers):
+                async with semaphore:
+                    try:
+                        offers = await fetch_nexarda_offers(self.session, game_id, plat, currency=country_to_currency(country))
+                    except Exception:
+                        logger.exception(f"Failed to fetch NEXARDA prices for {plat}/{game_id}; skipping.")
+                        return
+                    if offers:
+                        try:
+                            await self.process_nexarda_alert(offers, watchers, now)
+                        except Exception:
+                            logger.exception(f"Failed to process NEXARDA alert for {plat}/{game_id}; skipping.")
+
+            await asyncio.gather(*(check_one(*job) for job in console_jobs))
 
         logger.info("Wishlist price check completed.")
 
@@ -212,35 +277,41 @@ class ITADBot(commands.Bot):
                                   price=top_deal['price']['amount'], currency=top_deal['price']['currency'],
                                   cut=top_deal['cut'], expiry=expiry, now=now)
 
-    async def process_nexarda_alert(self, results, details, watchers, now):
-        if not results or not watchers: return
-        
-        # Find the best current price
-        best_deal = min(results, key=lambda x: x['price'])
-        game_id = watchers[0][1]
-        
-        # Use base_price from details as regular price if available
-        regular_price = details.get('base_price', best_deal['price']) if details else best_deal['price']
-        
-        if best_deal['price'] >= regular_price:
-            return
+    async def process_nexarda_alert(self, offers, watchers, now):
+        if not offers or not watchers: return
 
-        cut = int(((regular_price - best_deal['price']) / regular_price) * 100)
-        await self.dispatch_alert(game_id, watchers=watchers, 
-                                  deal_url=best_deal['shop_url'], shop_name=best_deal['shop_name'], 
-                                  price=best_deal['price'], currency='USD',
-                                  cut=cut, expiry=None, now=now)
+        # Find the best current price among on-sale offers
+        on_sale = [o for o in offers if o['discount'] > 0]
+        if not on_sale:
+            return
+        best_deal = min(on_sale, key=lambda x: x['price'])
+        game_id = watchers[0][1]
+
+        await self.dispatch_alert(game_id, watchers=watchers,
+                                  deal_url=best_deal['url'], shop_name=best_deal['store']['name'],
+                                  price=best_deal['price'], currency=best_deal['currency'],
+                                  cut=best_deal['discount'], expiry=None, now=now)
 
     async def dispatch_alert(self, game_id, watchers, deal_url, shop_name, price, currency, cut, expiry, now):
         title = watchers[0][2]
-        dm_alerts, mention_alerts = [], {}
+        platform = watchers[0][10]
+        # Bucket recipients by (method, is_expiring) so each group gets an accurate message
+        # instead of all recipients sharing whichever state the last watcher processed happened to be in.
+        dm_alerts = {False: [], True: []}
+        mention_alerts = {False: {}, True: {}}
 
         if expiry is not None:
             try: expiry = int(expiry)
             except: expiry = None
 
         for watcher in watchers:
-            user_id, _, _, _, method, g_id, c_id, last_url, state, snoozed, platform = watcher
+            user_id, _, _, _, method, g_id, c_id, last_url, state, snoozed, _platform, min_discount, max_price = watcher
+
+            if min_discount and cut < min_discount:
+                continue
+            if max_price is not None and price > max_price:
+                continue
+
             is_new_deal = (deal_url != last_url)
             is_expiring = bool(expiry and (expiry - now) < 28800 and state == 1)
 
@@ -248,9 +319,9 @@ class ITADBot(commands.Bot):
                 continue
 
             if method == 'mention' and g_id and c_id:
-                mention_alerts.setdefault((g_id, c_id), []).append(user_id)
+                mention_alerts[is_expiring].setdefault((g_id, c_id), []).append(user_id)
             else:
-                dm_alerts.append(user_id)
+                dm_alerts[is_expiring].append(user_id)
 
             # Update DB state
             new_alert_state = 1 if is_new_deal else (2 if is_expiring else state)
@@ -261,23 +332,33 @@ class ITADBot(commands.Bot):
         await self.db.commit()
 
         price_fmt = f"{CURRENCY_SYMBOLS.get(currency, '$')}{price:.2f}"
-        prefix = "🔔 **New Deal Alert!**" if not is_expiring else "⏳ **Final Call! Deal Expiring Soon:**"
-        msg = f"{prefix}\n'{title}' ({platform.upper()}) is currently **{price_fmt}** ({cut}% off) at {shop_name}.\nLink: {deal_url}"
         view = WishlistActionView(game_id, title)
 
-        for u_id in dm_alerts:
-            try:
-                user = await self.fetch_user(u_id)
-                if user: await user.send(msg, view=view)
-            except: pass
+        def build_msg(is_expiring):
+            prefix = "⏳ **Final Call! Deal Expiring Soon:**" if is_expiring else "🔔 **New Deal Alert!**"
+            return f"{prefix}\n'{title}' ({platform.upper()}) is currently **{price_fmt}** ({cut}% off) at {shop_name}.\nLink: {deal_url}"
 
-        for (gid, cid), u_ids in mention_alerts.items():
-            try:
-                channel = self.get_channel(cid) or await self.fetch_channel(cid)
-                if channel:
-                    pings = " ".join([f"<@{uid}>" for uid in u_ids])
-                    await channel.send(content=f"{pings} {msg}", view=view)
-            except: pass
+        for is_expiring, u_ids in dm_alerts.items():
+            if not u_ids:
+                continue
+            msg = build_msg(is_expiring)
+            for u_id in u_ids:
+                try:
+                    user = await self.fetch_user(u_id)
+                    if user: await user.send(msg, view=view)
+                except: pass
+
+        for is_expiring, channels in mention_alerts.items():
+            if not channels:
+                continue
+            msg = build_msg(is_expiring)
+            for (gid, cid), u_ids in channels.items():
+                try:
+                    channel = self.get_channel(cid) or await self.fetch_channel(cid)
+                    if channel:
+                        pings = " ".join([f"<@{uid}>" for uid in u_ids])
+                        await channel.send(content=f"{pings} {msg}", view=view)
+                except: pass
 
 bot = ITADBot()
 
@@ -472,15 +553,51 @@ async def fetch_nexarda_data(session, endpoint, params=None):
         logger.error(f"NEXARDA API Error: {resp.status} on {endpoint}")
         return None
 
+async def search_nexarda_games(session, query, platform):
+    """Search NEXARDA for games available on the given console family (playstation/xbox/nintendo)."""
+    resp = await fetch_nexarda_data(session, "search", {"type": "games", "q": query})
+    if not resp or not resp.get('success'):
+        return []
+
+    wanted_slugs = NEXARDA_SEARCH_PLATFORM_SLUGS.get(platform, set())
+    results = []
+    for item in resp.get('results', {}).get('items', []):
+        game_info = item.get('game_info') or {}
+        plat_slugs = {p.get('slug') for p in game_info.get('platforms', [])}
+        if plat_slugs & wanted_slugs:
+            results.append({
+                'id': game_info.get('id'),
+                'title': game_info.get('name') or item.get('title'),
+                'slug': item.get('slug'),
+            })
+    return results
+
+async def fetch_nexarda_offers(session, game_id, platform, currency='USD'):
+    """Fetch currently available, purchasable offers for a NEXARDA game id on the given console family."""
+    data = await fetch_nexarda_data(session, "prices", {"type": "game", "id": game_id, "currency": currency})
+    if not data or not data.get('success'):
+        return []
+
+    wanted_tags = NEXARDA_OFFER_PLATFORM_TAGS.get(platform, set())
+    offers = data.get('prices', {}).get('list', [])
+    resolved_currency = data.get('prices', {}).get('currency', currency)
+    return [
+        {**o, 'currency': resolved_currency}
+        for o in offers
+        if o.get('available') and o.get('price', -1) >= 0 and o.get('platform') in wanted_tags
+    ]
+
 class GameSelectView(discord.ui.View):
     """A view containing a dropdown for selecting a game from search results."""
-    def __init__(self, games, author, country, action="show", alert_method="dm", platform="pc"):
+    def __init__(self, games, author, country, action="show", alert_method="dm", platform="pc", min_discount=0, max_price=None):
         super().__init__(timeout=60)
         self.author = author
         self.country = country
         self.action = action # "show" (deals) or "add" (wishlist)
         self.alert_method = alert_method
         self.platform = platform
+        self.min_discount = min_discount
+        self.max_price = max_price
         self.games = games
         options = [
             discord.SelectOption(label=g['title'], value=g['id'], description=f"ID: {g['id']}")
@@ -513,13 +630,17 @@ class GameSelectView(discord.ui.View):
                     channel_id = row[0] if row else interaction.channel_id
 
             await bot.db.execute(
-                "INSERT OR REPLACE INTO wishlist (user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed, platform) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, 0, ?)",
-                (interaction.user.id, game_id, game_title, self.country, self.alert_method, guild_id, channel_id, self.platform)
+                "INSERT OR REPLACE INTO wishlist (user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed, platform, min_discount_percent, max_price) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, 0, ?, ?, ?)",
+                (interaction.user.id, game_id, game_title, self.country, self.alert_method, guild_id, channel_id, self.platform, self.min_discount or 0, self.max_price)
             )
             await bot.db.commit()
             msg = f"✅ Added **{game_title}** ({self.country}) to your wishlist!"
             msg += " I'll DM you when it goes on sale." if self.alert_method == "dm" else f" I'll mention you in <#{channel_id}> when it goes on sale."
-            
+            if self.min_discount:
+                msg += f" Only when discount is ≥{self.min_discount}%."
+            if self.max_price is not None:
+                msg += f" Only when price is ≤{self.max_price:.2f}."
+
             return await interaction.response.edit_message(content=msg, view=None)
         
         await interaction.response.defer()
@@ -543,27 +664,37 @@ async def show_deals(interaction, game_id, game_title, country, include_wishlist
 
     if platform != 'pc':
         # Logic for NEXARDA Console Deals
-        price_data = await fetch_nexarda_data(bot.session, "prices", {"type": "id", "id": game_id})
-        details = await fetch_nexarda_data(bot.session, "details", {"type": "id", "id": game_id})
-        
-        if not price_data or not price_data.get('results'):
+        offers = await fetch_nexarda_offers(bot.session, game_id, platform, currency=country_to_currency(country))
+
+        if not offers:
             return await interaction.followup.send(f"No current deals found for {game_title} on this platform.")
 
-        results = price_data['results']
+        offers.sort(key=lambda x: x['price'])
+        currency_symbol = CURRENCY_SYMBOLS.get(offers[0]['currency'], offers[0]['currency'])
+
+        product = await fetch_nexarda_data(bot.session, "product", {"type": "game", "id": game_id})
+        banner = None
+        if product and product.get('success'):
+            images = product.get('product', {}).get('images', {})
+            banner = images.get('banner') or images.get('cover')
+
         embed = discord.Embed(
-            title=f"{game_title} ({platform.upper()})",
-            url=f"https://www.nexarda.com/products/{game_id}",
-            description=f"📉 **Lowest Price:** ${min(results, key=lambda x: x['price'])['price']:.2f}",
+            title=f"{game_title} ({platform.capitalize()})",
+            url=f"https://www.nexarda.com{slug}" if slug else f"https://www.nexarda.com/games/{game_id}",
+            description=f"📉 **Lowest Price:** {currency_symbol}{offers[0]['price']:.2f}",
             color=0x3498db,
             timestamp=interaction.created_at
         )
         embed.set_author(name=f"Requested by {interaction.user.display_name}", icon_url=interaction.user.display_avatar.url)
         embed.set_footer(text="Data provided by NEXARDA")
-        
-        for deal in results[:10]:
+        if banner:
+            embed.set_image(url=banner)
+
+        for offer in offers[:10]:
+            cut_str = f" ({offer['discount']}% off)" if offer['discount'] else ""
             embed.add_field(
-                name=deal['shop_name'],
-                value=f"**${deal['price']:.2f}**\n[Link]({deal['shop_url']})",
+                name=offer['store']['name'],
+                value=f"**{currency_symbol}{offer['price']:.2f}**{cut_str}\n[Link]({offer['url']})",
                 inline=True
             )
 
@@ -717,11 +848,9 @@ async def show_deals(interaction, game_id, game_title, country, include_wishlist
     app_commands.Choice(name="France", value="FR")
 ], platform=[
     app_commands.Choice(name="PC (Storefronts like Steam, GOG, Epic)", value="pc"),
-    app_commands.Choice(name="PlayStation 4", value="ps4"),
-    app_commands.Choice(name="PlayStation 5", value="ps5"),
-    app_commands.Choice(name="Xbox One", value="xboxone"),
-    app_commands.Choice(name="Xbox Series X|S", value="xboxseries"),
-    app_commands.Choice(name="Nintendo Switch", value="switch")
+    app_commands.Choice(name="PlayStation", value="playstation"),
+    app_commands.Choice(name="Xbox", value="xbox"),
+    app_commands.Choice(name="Nintendo Switch", value="nintendo")
 ])
 async def deal_command(interaction: discord.Interaction, game_name: str, country: str = "US", platform: str = "pc", wishlist_buttons: bool = True):
     try:
@@ -731,14 +860,7 @@ async def deal_command(interaction: discord.Interaction, game_name: str, country
         if platform == 'pc':
             search_results = await fetch_itad_data(bot.session, "games/search/v1", {"title": game_name})
         else:
-            # NEXARDA Search
-            resp = await fetch_nexarda_data(bot.session, "search", {"type": "products", "q": game_name})
-            search_results = []
-            if resp and resp.get('results'):
-                # Filter results to include the requested platform
-                for res in resp['results']:
-                    if any(p['slug'] == platform for p in res.get('platforms', [])):
-                        search_results.append({'id': res['id'], 'title': res['title'], 'slug': res['slug']})
+            search_results = await search_nexarda_games(bot.session, game_name, platform)
 
         if not search_results:
             return await interaction.followup.send(f"No games found matching '{game_name}'.")
@@ -764,10 +886,12 @@ wishlist_group = app_commands.Group(name="wishlist", description="Manage your ga
 
 @wishlist_group.command(name="add", description="Add a game to your personal wishlist for sale alerts")
 @app_commands.describe(
-    game_name="The name of the game", 
+    game_name="The name of the game",
     country="The region to track prices for",
     alert_method="How should the bot notify you?",
-    platform="Choose the platform for this game"
+    platform="Choose the platform for this game",
+    max_price="Only alert when the price drops to or below this amount",
+    min_discount="Only alert when the discount is at least this percent"
 )
 @app_commands.choices(country=[
     app_commands.Choice(name="United States", value="US"),
@@ -781,24 +905,18 @@ wishlist_group = app_commands.Group(name="wishlist", description="Manage your ga
     app_commands.Choice(name="Mention in this channel", value="mention")
 ], platform=[
     app_commands.Choice(name="PC", value="pc"),
-    app_commands.Choice(name="PlayStation 4", value="ps4"),
-    app_commands.Choice(name="PlayStation 5", value="ps5"),
-    app_commands.Choice(name="Xbox One", value="xboxone"),
-    app_commands.Choice(name="Xbox Series X|S", value="xboxseries"),
-    app_commands.Choice(name="Nintendo Switch", value="switch")
+    app_commands.Choice(name="PlayStation", value="playstation"),
+    app_commands.Choice(name="Xbox", value="xbox"),
+    app_commands.Choice(name="Nintendo Switch", value="nintendo")
 ])
-async def wishlist_add(interaction: discord.Interaction, game_name: str, country: str = "US", alert_method: str = "dm", platform: str = "pc"):
+async def wishlist_add(interaction: discord.Interaction, game_name: str, country: str = "US", alert_method: str = "dm", platform: str = "pc",
+                        max_price: float = None, min_discount: app_commands.Range[int, 1, 99] = None):
     await interaction.response.defer()
-    
+
     if platform == 'pc':
         search_results = await fetch_itad_data(bot.session, "games/search/v1", {"title": game_name})
     else:
-        resp = await fetch_nexarda_data(bot.session, "search", {"type": "products", "q": game_name})
-        search_results = []
-        if resp and resp.get('results'):
-            for res in resp['results']:
-                if any(p['slug'] == platform for p in res.get('platforms', [])):
-                    search_results.append({'id': res['id'], 'title': res['title'], 'slug': res['slug']})
+        search_results = await search_nexarda_games(bot.session, game_name, platform)
 
     if not search_results:
         return await interaction.followup.send(f"No games found matching '{game_name}'.")
@@ -807,7 +925,7 @@ async def wishlist_add(interaction: discord.Interaction, game_name: str, country
         game = search_results[0]
         guild_id = interaction.guild_id if alert_method == "mention" else None
         channel_id = None
-        
+
         if alert_method == "mention":
             # Check if a default server channel is configured
             async with bot.db.execute("SELECT alert_channel_id FROM guild_settings WHERE guild_id = ?", (interaction.guild_id,)) as cursor:
@@ -815,15 +933,20 @@ async def wishlist_add(interaction: discord.Interaction, game_name: str, country
                 channel_id = row[0] if row else interaction.channel_id
 
         await bot.db.execute(
-            "INSERT OR REPLACE INTO wishlist (user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, 0)",
-            (interaction.user.id, game['id'], game['title'], country, alert_method, guild_id, channel_id)
+            "INSERT OR REPLACE INTO wishlist (user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed, platform, min_discount_percent, max_price) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, 0, ?, ?, ?)",
+            (interaction.user.id, game['id'], game['title'], country, alert_method, guild_id, channel_id, platform, min_discount or 0, max_price)
         )
         await bot.db.commit()
         msg = f"✅ Added **{game['title']}** ({country}) to your wishlist!"
         msg += " I'll DM you when it goes on sale." if alert_method == "dm" else f" I'll mention you in <#{channel_id}> when it goes on sale."
+        if min_discount:
+            msg += f" Only when discount is ≥{min_discount}%."
+        if max_price is not None:
+            msg += f" Only when price is ≤{max_price:.2f}."
         await interaction.followup.send(msg)
     else:
-        view = GameSelectView(search_results, interaction.user, country, action="add", alert_method=alert_method)
+        view = GameSelectView(search_results, interaction.user, country, action="add", alert_method=alert_method,
+                               platform=platform, min_discount=min_discount or 0, max_price=max_price)
         await interaction.followup.send(f"Multiple results for '{game_name}'. Select which to add:", view=view)
 
 @wishlist_group.command(name="update_alert", description="Change notification preference for a game or your whole wishlist")
@@ -860,15 +983,60 @@ async def wishlist_update_alert(interaction: discord.Interaction, alert_method: 
     await bot.db.commit()
     await interaction.response.send_message(msg, ephemeral=True)
 
+@wishlist_group.command(name="threshold", description="Set a minimum discount % or maximum price for alerts on a wishlist item")
+@app_commands.describe(
+    game_id="The game ID or title to update (leave empty to update all)",
+    max_price="Only alert when the price drops to or below this amount (omit to clear)",
+    min_discount="Only alert when the discount is at least this percent (omit to clear)"
+)
+async def wishlist_threshold(interaction: discord.Interaction, game_id: str = None, max_price: float = None, min_discount: app_commands.Range[int, 1, 99] = None):
+    if game_id:
+        cursor = await bot.db.execute(
+            "UPDATE wishlist SET min_discount_percent = ?, max_price = ? WHERE user_id = ? AND (game_id = ? OR game_title = ?)",
+            (min_discount or 0, max_price, interaction.user.id, game_id, game_id)
+        )
+        if cursor.rowcount == 0:
+            return await interaction.response.send_message(f"Could not find '{game_id}' in your wishlist.", ephemeral=True)
+        msg = f"✅ Updated alert thresholds for '{game_id}'."
+    else:
+        await bot.db.execute(
+            "UPDATE wishlist SET min_discount_percent = ?, max_price = ? WHERE user_id = ?",
+            (min_discount or 0, max_price, interaction.user.id)
+        )
+        msg = "✅ Updated alert thresholds for all games in your wishlist."
+
+    if min_discount:
+        msg += f" Only alerting when discount is ≥{min_discount}%."
+    if max_price is not None:
+        msg += f" Only alerting when price is ≤{max_price:.2f}."
+    if not min_discount and max_price is None:
+        msg += " Thresholds cleared."
+
+    await bot.db.commit()
+    await interaction.response.send_message(msg, ephemeral=True)
+
 @wishlist_group.command(name="list", description="View your current wishlist")
 async def wishlist_list(interaction: discord.Interaction):
-    async with bot.db.execute("SELECT game_title, country, alert_method FROM wishlist WHERE user_id = ?", (interaction.user.id,)) as cursor:
+    async with bot.db.execute(
+        "SELECT game_title, country, alert_method, min_discount_percent, max_price FROM wishlist WHERE user_id = ?",
+        (interaction.user.id,)
+    ) as cursor:
         items = await cursor.fetchall()
-    
+
     if not items:
         return await interaction.response.send_message("Your wishlist is empty!", ephemeral=True)
-    
-    list_str = "\n".join([f"• {item[0]} ({item[1]}) - Alert: **{item[2]}**" for item in items])
+
+    def fmt(item):
+        title, country, alert_method, min_discount, max_price = item
+        extras = []
+        if min_discount:
+            extras.append(f"≥{min_discount}% off")
+        if max_price is not None:
+            extras.append(f"≤{max_price:.2f}")
+        extra_str = f" [{', '.join(extras)}]" if extras else ""
+        return f"• {title} ({country}) - Alert: **{alert_method}**{extra_str}"
+
+    list_str = "\n".join(fmt(item) for item in items)
     await interaction.response.send_message(f"### Your Wishlist:\n{list_str}", ephemeral=True)
 
 @wishlist_group.command(name="remove", description="Remove a game from your wishlist")

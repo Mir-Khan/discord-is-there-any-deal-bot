@@ -1,7 +1,8 @@
 import pytest
 import aiohttp
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
-from main import fetch_itad_data, deal_command, GameSelectView, bot, wishlist_add, wishlist_list, wishlist_update_alert, WelcomeView, DealView, wishlist_remove, wishlist_clear, force_check, set_alert_channel
+import main
+from main import fetch_itad_data, deal_command, GameSelectView, bot, wishlist_add, wishlist_list, wishlist_update_alert, wishlist_threshold, WelcomeView, DealView, wishlist_remove, wishlist_clear, force_check, set_alert_channel
 import discord
 import os
 import datetime
@@ -296,7 +297,7 @@ async def test_wishlist_add_single_result():
         assert mock_db.execute.call_count >= 1
         args = mock_db.execute.call_args[0]
         assert "INSERT OR REPLACE INTO wishlist" in args[0]
-        assert args[1] == (mock_interaction.user.id, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "dm", None, None)
+        assert args[1] == (mock_interaction.user.id, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "dm", None, None, "pc", 0, None)
         
         mock_interaction.followup.send.assert_called_once_with(
             "✅ Added **Inscryption** (US) to your wishlist! I'll DM you when it goes on sale."
@@ -331,7 +332,7 @@ async def test_wishlist_list_with_items():
     mock_db.execute = MagicMock()
     mock_context_manager = AsyncMock()
     mock_context_manager.__aenter__.return_value = mock_cursor
-    mock_cursor.fetchall.return_value = [("Inscryption", "US", "dm"), ("Slay the Spire", "GB", "mention")]
+    mock_cursor.fetchall.return_value = [("Inscryption", "US", "dm", 0, None), ("Slay the Spire", "GB", "mention", 20, 9.99)]
     mock_db.execute.return_value = mock_context_manager
 
     with pytest.MonkeyPatch().context() as mp:
@@ -470,10 +471,10 @@ async def test_check_wishlists_sends_alerts():
 
     # 1. Mock DB SELECT for all wishlist items (batch fetch)
     mock_cursor = AsyncMock()
-    # 10 columns: user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed
+    # user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed, platform, min_discount_percent, max_price
     mock_cursor.fetchall.return_value = [
-        (123, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "dm", None, None, None, 0, 0),
-        (456, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "mention", 777, 789, None, 0, 0)
+        (123, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "dm", None, None, None, 0, 0, "pc", 0, None),
+        (456, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "mention", 777, 789, None, 0, 0, "pc", 0, None)
     ]
     mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
 
@@ -525,7 +526,7 @@ async def test_check_wishlists_skips_fake_sale():
     # 1. Mock DB SELECT: User 123 watches "Forza"
     mock_cursor = AsyncMock()
     mock_cursor.fetchall.return_value = [
-        (123, "forza-id", "Forza Horizon 6", "US", "dm", None, None, None, 0, 0)
+        (123, "forza-id", "Forza Horizon 6", "US", "dm", None, None, None, 0, 0, "pc", 0, None)
     ]
     mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
 
@@ -560,6 +561,172 @@ async def test_check_wishlists_skips_fake_sale():
         mock_user.send.assert_not_called()
 
 @pytest.mark.asyncio
+async def test_check_wishlists_skips_below_discount_threshold():
+    """A real sale should still be suppressed if it doesn't meet the user's min discount threshold."""
+    mock_db = MagicMock()
+    mock_db.commit = AsyncMock()
+    mock_session = MagicMock(spec=aiohttp.ClientSession)
+    mock_user = AsyncMock()
+
+    mock_cursor = AsyncMock()
+    # User requires at least 50% off; the deal below is only 25% off.
+    mock_cursor.fetchall.return_value = [
+        (123, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "dm", None, None, None, 0, 0, "pc", 50, None)
+    ]
+    mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
+
+    mock_response_itad = AsyncMock()
+    mock_response_itad.status = 200
+    sale_data = [MOCK_INSCRYPTION_DEALS_DATA[0].copy()]
+    sale_data[0]['deals'] = [{
+        "shop": {"name": "GOG"},
+        "price": {"amount": 14.99, "currency": "USD"},
+        "regular": {"amount": 19.99, "currency": "USD"},
+        "cut": 25,
+        "url": "https://www.gog.com/game/inscryption"
+    }]
+    mock_response_itad.json.return_value = sale_data
+    mock_session.request.return_value.__aenter__.return_value = mock_response_itad
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(bot, 'db', mock_db)
+        mp.setattr(bot, 'session', mock_session)
+        mp.setattr(bot, 'fetch_user', AsyncMock(return_value=mock_user))
+        mp.setattr(bot.check_wishlists, 'start', MagicMock())
+        mp.setattr(bot.check_wishlists, 'stop', MagicMock())
+
+        await bot.check_wishlists()
+
+        mock_user.send.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_check_wishlists_skips_above_max_price_threshold():
+    """A real sale should still be suppressed if the sale price is above the user's max price threshold."""
+    mock_db = MagicMock()
+    mock_db.commit = AsyncMock()
+    mock_session = MagicMock(spec=aiohttp.ClientSession)
+    mock_user = AsyncMock()
+
+    mock_cursor = AsyncMock()
+    # User only wants alerts at or below $10; the deal below is $14.99.
+    mock_cursor.fetchall.return_value = [
+        (123, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "dm", None, None, None, 0, 0, "pc", 0, 10.0)
+    ]
+    mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
+
+    mock_response_itad = AsyncMock()
+    mock_response_itad.status = 200
+    sale_data = [MOCK_INSCRYPTION_DEALS_DATA[0].copy()]
+    sale_data[0]['deals'] = [{
+        "shop": {"name": "GOG"},
+        "price": {"amount": 14.99, "currency": "USD"},
+        "regular": {"amount": 19.99, "currency": "USD"},
+        "cut": 25,
+        "url": "https://www.gog.com/game/inscryption"
+    }]
+    mock_response_itad.json.return_value = sale_data
+    mock_session.request.return_value.__aenter__.return_value = mock_response_itad
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(bot, 'db', mock_db)
+        mp.setattr(bot, 'session', mock_session)
+        mp.setattr(bot, 'fetch_user', AsyncMock(return_value=mock_user))
+        mp.setattr(bot.check_wishlists, 'start', MagicMock())
+        mp.setattr(bot.check_wishlists, 'stop', MagicMock())
+
+        await bot.check_wishlists()
+
+        mock_user.send.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_wishlist_threshold_updates_single_game():
+    mock_interaction = MockInteraction()
+    mock_db = MagicMock()
+    mock_db.commit = AsyncMock()
+    mock_cursor = MagicMock()
+    mock_cursor.rowcount = 1
+    mock_db.execute = AsyncMock(return_value=mock_cursor)
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(bot, 'db', mock_db)
+        await wishlist_threshold.callback(mock_interaction, game_id="Inscryption", max_price=9.99, min_discount=40)
+
+        args = mock_db.execute.call_args[0]
+        assert "UPDATE wishlist SET min_discount_percent = ?, max_price = ?" in args[0]
+        assert args[1] == (40, 9.99, mock_interaction.user.id, "Inscryption", "Inscryption")
+        mock_interaction.response.send_message.assert_called_once()
+        msg = mock_interaction.response.send_message.call_args[0][0]
+        assert "≥40%" in msg
+        assert "≤9.99" in msg
+
+@pytest.mark.asyncio
+async def test_check_wishlists_survives_internal_exception():
+    """An unexpected error inside the wishlist check must be caught, not left to kill the recurring task."""
+    mock_db = MagicMock()
+
+    class ExplodingCursor:
+        def __await__(self):
+            async def _raise(): raise RuntimeError("simulated DB failure")
+            return _raise().__await__()
+        async def __aenter__(self):
+            raise RuntimeError("simulated DB failure")
+        async def __aexit__(self, *args):
+            pass
+
+    mock_db.execute = MagicMock(return_value=ExplodingCursor())
+    mock_session = MagicMock(spec=aiohttp.ClientSession)
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(bot, 'db', mock_db)
+        mp.setattr(bot, 'session', mock_session)
+        mp.setattr(bot.check_wishlists, 'start', MagicMock())
+        mp.setattr(bot.check_wishlists, 'stop', MagicMock())
+
+        # Must not raise - the loop needs to complete normally so tasks.loop reschedules it.
+        await bot.check_wishlists()
+
+@pytest.mark.asyncio
+async def test_check_wishlists_isolates_console_item_failures():
+    """One console game's price fetch failing must not stop other console games from being checked."""
+    mock_db = MagicMock()
+    mock_db.commit = AsyncMock()
+    mock_session = MagicMock(spec=aiohttp.ClientSession)
+    mock_user = AsyncMock()
+
+    mock_cursor = AsyncMock()
+    mock_cursor.fetchall.return_value = [
+        (123, "broken-game", "Broken Game", "US", "dm", None, None, None, 0, 0, "xbox", 0, None),
+        (456, "working-game", "Working Game", "US", "dm", None, None, None, 0, 0, "xbox", 0, None),
+    ]
+    mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
+
+    async def fake_fetch_offers(session, game_id, platform, currency='USD'):
+        if game_id == "broken-game":
+            raise RuntimeError("simulated NEXARDA failure")
+        return [{
+            'url': 'https://nexarda.co/plg/1',
+            'store': {'name': 'Microsoft Store'},
+            'platform': 'Xbox',
+            'available': True,
+            'price': 9.99,
+            'discount': 50,
+            'currency': 'USD',
+        }]
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(bot, 'db', mock_db)
+        mp.setattr(bot, 'session', mock_session)
+        mp.setattr(bot, 'fetch_user', AsyncMock(return_value=mock_user))
+        mp.setattr(bot.check_wishlists, 'start', MagicMock())
+        mp.setattr(bot.check_wishlists, 'stop', MagicMock())
+        mp.setattr(main, 'fetch_nexarda_offers', fake_fetch_offers)
+
+        await bot.check_wishlists()
+
+        # The working game's watcher should still get an alert despite the other game's fetch failing.
+        mock_user.send.assert_called_once()
+
+@pytest.mark.asyncio
 async def test_check_wishlists_sends_final_call_alert():
     mock_db = MagicMock()
     mock_db.commit = AsyncMock()
@@ -572,9 +739,9 @@ async def test_check_wishlists_sends_final_call_alert():
     
     # 1. Mock DB SELECT for all wishlist items
     mock_cursor = AsyncMock()
-    # user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed
+    # user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed, platform, min_discount_percent, max_price
     mock_cursor.fetchall.return_value = [
-        (123, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "dm", None, None, deal_url, 1, 0)
+        (123, "018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", "dm", None, None, deal_url, 1, 0, "pc", 0, None)
     ]
     mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
 
