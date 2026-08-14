@@ -2,7 +2,7 @@ import pytest
 import aiohttp
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import main
-from main import fetch_itad_data, deal_command, GameSelectView, bot, wishlist_add, wishlist_list, wishlist_update_alert, wishlist_threshold, WelcomeView, DealView, wishlist_remove, wishlist_clear, force_check, set_alert_channel
+from main import fetch_itad_data, deal_command, GameSelectView, bot, wishlist_add, wishlist_list, wishlist_update_alert, wishlist_threshold, WelcomeView, DealView, WishlistThresholdModal, wishlist_remove, wishlist_clear, force_check, set_alert_channel
 import discord
 import os
 import datetime
@@ -856,27 +856,107 @@ async def test_deal_view_add_dm():
         }
         # Initially not on wishlist
         view = DealView("018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", is_on_wishlist=False, guild_id=None, top_deal=mock_deal)
-        
-        # Trigger callback
-        await view.add_dm_callback(mock_interaction)
-        
+
+        # finalize_add is what the threshold modal calls on_submit; no threshold set here.
+        await view.finalize_add(mock_interaction, 'dm', None, 0)
+
         # Verify follow-up confirmation sent
         mock_interaction.followup.send.assert_called_once()
-        
+
         # Verify DB insertion
         assert mock_db.execute.call_count >= 1
         args = mock_db.execute.call_args[0]
         assert "INSERT OR REPLACE INTO wishlist" in args[0]
         assert "dm" in args[1]
-        
+
         # Verify UUID and alert_state are correct
-        # Indices based on: user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed
+        # Indices based on: user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, [is_snoozed hardcoded], platform, min_discount_percent, max_price
         assert args[1][1] == "018d937f-4610-7109-b250-072bf2e0d351"
         assert args[1][7] == mock_deal['url']
-        assert args[1][8] == 1 
-        
+        assert args[1][8] == 1
+
         assert view.is_on_wishlist is True
         mock_interaction.response.edit_message.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_deal_view_add_dm_button_opens_modal():
+    mock_interaction = MockInteraction()
+    view = DealView("018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", is_on_wishlist=False)
+
+    await view.add_dm_callback(mock_interaction)
+
+    mock_interaction.response.send_modal.assert_called_once()
+    modal = mock_interaction.response.send_modal.call_args[0][0]
+    assert isinstance(modal, WishlistThresholdModal)
+    assert modal.alert_method == 'dm'
+
+@pytest.mark.asyncio
+async def test_deal_view_add_mention_button_opens_modal():
+    mock_interaction = MockInteraction()
+    view = DealView("018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", is_on_wishlist=False, guild_id=456)
+
+    await view.add_mention_callback(mock_interaction)
+
+    mock_interaction.response.send_modal.assert_called_once()
+    modal = mock_interaction.response.send_modal.call_args[0][0]
+    assert isinstance(modal, WishlistThresholdModal)
+    assert modal.alert_method == 'mention'
+
+@pytest.mark.asyncio
+async def test_wishlist_threshold_modal_forwards_parsed_values():
+    mock_interaction = MockInteraction()
+    view = MagicMock()
+    view.finalize_add = AsyncMock()
+    modal = WishlistThresholdModal(view, 'dm')
+    modal.max_price_input._value = "9.99"
+    modal.min_discount_input._value = "40"
+
+    await modal.on_submit(mock_interaction)
+
+    view.finalize_add.assert_called_once_with(mock_interaction, 'dm', 9.99, 40)
+
+@pytest.mark.asyncio
+async def test_wishlist_threshold_modal_blank_inputs_use_no_threshold():
+    mock_interaction = MockInteraction()
+    view = MagicMock()
+    view.finalize_add = AsyncMock()
+    modal = WishlistThresholdModal(view, 'mention')
+    modal.max_price_input._value = ""
+    modal.min_discount_input._value = ""
+
+    await modal.on_submit(mock_interaction)
+
+    view.finalize_add.assert_called_once_with(mock_interaction, 'mention', None, 0)
+
+@pytest.mark.asyncio
+async def test_wishlist_threshold_modal_rejects_invalid_price():
+    mock_interaction = MockInteraction()
+    view = MagicMock()
+    view.finalize_add = AsyncMock()
+    modal = WishlistThresholdModal(view, 'dm')
+    modal.max_price_input._value = "not-a-number"
+    modal.min_discount_input._value = ""
+
+    await modal.on_submit(mock_interaction)
+
+    view.finalize_add.assert_not_called()
+    mock_interaction.response.send_message.assert_called_once()
+    assert "Max price" in mock_interaction.response.send_message.call_args[0][0]
+
+@pytest.mark.asyncio
+async def test_wishlist_threshold_modal_rejects_out_of_range_discount():
+    mock_interaction = MockInteraction()
+    view = MagicMock()
+    view.finalize_add = AsyncMock()
+    modal = WishlistThresholdModal(view, 'dm')
+    modal.max_price_input._value = ""
+    modal.min_discount_input._value = "150"
+
+    await modal.on_submit(mock_interaction)
+
+    view.finalize_add.assert_not_called()
+    mock_interaction.response.send_message.assert_called_once()
+    assert "Min discount" in mock_interaction.response.send_message.call_args[0][0]
 
 @pytest.mark.asyncio
 async def test_deal_view_add_expiring_soon():
@@ -899,9 +979,9 @@ async def test_deal_view_add_expiring_soon():
     with pytest.MonkeyPatch().context() as mp:
         mp.setattr(bot, 'db', mock_db)
         view = DealView("018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", is_on_wishlist=False, top_deal=mock_deal)
-        
-        await view.add_dm_callback(mock_interaction)
-        
+
+        await view.finalize_add(mock_interaction, 'dm', None, 0)
+
         # Verify DB insertion has alert_state=2 (Expiring)
         args = mock_db.execute.call_args[0]
         assert args[1][8] == 2
@@ -1009,8 +1089,8 @@ async def test_deal_view_add_mention():
         }
         view = DealView("018d937f-4610-7109-b250-072bf2e0d351", "Inscryption", "US", is_on_wishlist=False, guild_id=456, top_deal=mock_deal)
 
-        await view.add_mention_callback(mock_interaction)
-        
+        await view.finalize_add(mock_interaction, 'mention', None, 0)
+
         # Verify DB insertion contains mention info
         # 1 for SELECT alert_channel_id, 1 for INSERT
         assert mock_db.execute.call_count >= 2

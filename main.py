@@ -432,46 +432,24 @@ class DealView(discord.ui.View):
             self.add_item(btn_rem)
 
     async def add_dm_callback(self, interaction: discord.Interaction):
-        deal_url = self.top_deal['url'] if self.top_deal else None
-        expiry = self.top_deal.get('expiry') if self.top_deal else None
-        alert_state = 1 if deal_url else 0
-        
-        is_expiring_soon = False
-        if self.top_deal and expiry:
-            try:
-                if (int(expiry) - int(time.time())) < 28800:
-                    alert_state = 2
-                    is_expiring_soon = True
-            except (ValueError, TypeError): pass
-
-        await bot.db.execute(
-            "INSERT OR REPLACE INTO wishlist (user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed, platform) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-            (interaction.user.id, self.game_id, self.game_title, self.country, 'dm', None, None, deal_url, alert_state, self.platform)
-        )
-        await bot.db.commit()
-        
-        if is_expiring_soon:
-            price = f"{CURRENCY_SYMBOLS.get(self.top_deal['price']['currency'], '')}{self.top_deal['price']['amount']:.2f}"
-            msg = f"⏳ **Final Call! Deal Expiring Soon:**\n'{self.game_title}' is currently **{price}** ({self.top_deal['cut']}% off) at {self.top_deal['shop']['name']}.\nLink: {self.top_deal['url']}"
-            try:
-                await interaction.user.send(msg, view=WishlistActionView(self.game_id, self.game_title))
-            except Exception as e:
-                logger.warning(f"Could not send immediate expiry DM: {e}")
-
-        self.is_on_wishlist = True
-        self._update_buttons()
-        await interaction.response.edit_message(view=self)
-        await interaction.followup.send(f"✅ Added **{self.game_title}** to your wishlist with DM alerts!", ephemeral=True)
+        await interaction.response.send_modal(WishlistThresholdModal(self, 'dm'))
 
     async def add_mention_callback(self, interaction: discord.Interaction):
-        async with bot.db.execute("SELECT alert_channel_id FROM guild_settings WHERE guild_id = ?", (interaction.guild_id,)) as cursor:
-            row = await cursor.fetchone()
-            channel_id = row[0] if row else interaction.channel_id
+        await interaction.response.send_modal(WishlistThresholdModal(self, 'mention'))
+
+    async def finalize_add(self, interaction: discord.Interaction, alert_method: str, max_price, min_discount):
+        """Called by WishlistThresholdModal.on_submit once the user has filled in (or skipped) thresholds."""
+        guild_id, channel_id = None, None
+        if alert_method == 'mention':
+            guild_id = interaction.guild_id
+            async with bot.db.execute("SELECT alert_channel_id FROM guild_settings WHERE guild_id = ?", (interaction.guild_id,)) as cursor:
+                row = await cursor.fetchone()
+                channel_id = row[0] if row else interaction.channel_id
 
         deal_url = self.top_deal['url'] if self.top_deal else None
         expiry = self.top_deal.get('expiry') if self.top_deal else None
         alert_state = 1 if deal_url else 0
-        
+
         is_expiring_soon = False
         if self.top_deal and expiry:
             try:
@@ -481,25 +459,37 @@ class DealView(discord.ui.View):
             except (ValueError, TypeError): pass
 
         await bot.db.execute(
-            "INSERT OR REPLACE INTO wishlist (user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed, platform) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-            (interaction.user.id, self.game_id, self.game_title, self.country, 'mention', interaction.guild_id, channel_id, deal_url, alert_state, self.platform)
+            "INSERT OR REPLACE INTO wishlist (user_id, game_id, game_title, country, alert_method, guild_id, channel_id, last_deal_url, alert_state, is_snoozed, platform, min_discount_percent, max_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+            (interaction.user.id, self.game_id, self.game_title, self.country, alert_method, guild_id, channel_id, deal_url, alert_state, self.platform, min_discount or 0, max_price)
         )
         await bot.db.commit()
-        
+
         if is_expiring_soon:
             price = f"{CURRENCY_SYMBOLS.get(self.top_deal['price']['currency'], '')}{self.top_deal['price']['amount']:.2f}"
             msg = f"⏳ **Final Call! Deal Expiring Soon:**\n'{self.game_title}' is currently **{price}** ({self.top_deal['cut']}% off) at {self.top_deal['shop']['name']}.\nLink: {self.top_deal['url']}"
             try:
-                channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-                if channel:
-                    await channel.send(content=f"<@{interaction.user.id}> {msg}", view=WishlistActionView(self.game_id, self.game_title))
+                if alert_method == 'dm':
+                    await interaction.user.send(msg, view=WishlistActionView(self.game_id, self.game_title))
+                else:
+                    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+                    if channel:
+                        await channel.send(content=f"<@{interaction.user.id}> {msg}", view=WishlistActionView(self.game_id, self.game_title))
             except Exception as e:
-                logger.warning(f"Could not send immediate expiry mention: {e}")
+                logger.warning(f"Could not send immediate expiry alert: {e}")
 
         self.is_on_wishlist = True
         self._update_buttons()
         await interaction.response.edit_message(view=self)
-        await interaction.followup.send(f"✅ Added **{self.game_title}** to your wishlist! You'll be mentioned in <#{channel_id}>.", ephemeral=True)
+
+        if alert_method == 'dm':
+            msg = f"✅ Added **{self.game_title}** to your wishlist with DM alerts!"
+        else:
+            msg = f"✅ Added **{self.game_title}** to your wishlist! You'll be mentioned in <#{channel_id}>."
+        if min_discount:
+            msg += f" Only when discount is ≥{min_discount}%."
+        if max_price is not None:
+            msg += f" Only when price is ≤{max_price:.2f}."
+        await interaction.followup.send(msg, ephemeral=True)
 
     async def remove_callback(self, interaction: discord.Interaction):
         await bot.db.execute("DELETE FROM wishlist WHERE user_id = ? AND game_id = ?", (interaction.user.id, self.game_id))
@@ -508,6 +498,51 @@ class DealView(discord.ui.View):
         self._update_buttons()
         await interaction.response.edit_message(view=self)
         await interaction.followup.send(f"🗑️ Removed **{self.game_title}** from your wishlist.", ephemeral=True)
+
+class WishlistThresholdModal(discord.ui.Modal):
+    """Optional threshold entry shown when adding a game to the wishlist from a /deal search result."""
+    def __init__(self, deal_view: DealView, alert_method: str):
+        super().__init__(title="Add to Wishlist")
+        self.deal_view = deal_view
+        self.alert_method = alert_method
+        self.max_price_input = discord.ui.TextInput(
+            label="Max price (optional)",
+            placeholder="e.g. 9.99 - only alert at or below this price",
+            required=False,
+            max_length=10,
+        )
+        self.min_discount_input = discord.ui.TextInput(
+            label="Min discount % (optional)",
+            placeholder="e.g. 40 - only alert at this discount or deeper",
+            required=False,
+            max_length=3,
+        )
+        self.add_item(self.max_price_input)
+        self.add_item(self.min_discount_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        max_price = None
+        min_discount = 0
+
+        raw_price = self.max_price_input.value.strip()
+        if raw_price:
+            try:
+                max_price = float(raw_price)
+                if max_price <= 0:
+                    raise ValueError
+            except ValueError:
+                return await interaction.response.send_message("❌ Max price must be a positive number.", ephemeral=True)
+
+        raw_discount = self.min_discount_input.value.strip()
+        if raw_discount:
+            try:
+                min_discount = int(raw_discount)
+                if not (1 <= min_discount <= 99):
+                    raise ValueError
+            except ValueError:
+                return await interaction.response.send_message("❌ Min discount must be a whole number between 1 and 99.", ephemeral=True)
+
+        await self.deal_view.finalize_add(interaction, self.alert_method, max_price, min_discount)
 
 class WelcomeView(discord.ui.View):
     """A view sent on bot join to highlight features and set a default channel."""
