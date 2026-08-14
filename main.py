@@ -566,7 +566,9 @@ async def search_nexarda_games(session, query, platform):
         plat_slugs = {p.get('slug') for p in game_info.get('platforms', [])}
         if plat_slugs & wanted_slugs:
             results.append({
-                'id': game_info.get('id'),
+                # Discord always returns select-menu values as strings, and this id is compared
+                # against that later, so it must be a string here too (NEXARDA returns it as an int).
+                'id': str(game_info.get('id')),
                 'title': game_info.get('name') or item.get('title'),
                 'slug': item.get('slug'),
             })

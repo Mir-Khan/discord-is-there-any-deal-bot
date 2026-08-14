@@ -390,6 +390,34 @@ async def test_game_select_view_add_to_wishlist():
         mock_interaction.response.edit_message.assert_called_once()
 
 @pytest.mark.asyncio
+async def test_game_select_view_matches_numeric_console_ids():
+    """Regression test: NEXARDA game ids are ints, but Discord always returns selected
+    select-menu values as strings, so the lookup must not be broken by that type mismatch
+    (previously caused every multi-result console search to fail with 'Could not find game details')."""
+    mock_interaction = MockInteraction()
+    mock_db = MagicMock()
+    mock_db.commit = AsyncMock()
+    mock_cursor = AsyncMock()
+    mock_cursor.fetchone.return_value = [None]
+    mock_db.execute.side_effect = lambda *args, **kwargs: MockAiosqliteExecute(mock_cursor)
+
+    console_games = [{'id': '1651', 'title': 'Super Mario Odyssey', 'slug': '/games/super-mario-odyssey-(1651)'}]
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(bot, 'db', mock_db)
+        view = GameSelectView(console_games, mock_interaction.user, "US", action="add", alert_method="dm", platform="nintendo")
+
+        with patch.object(type(view.select), 'values', new_callable=PropertyMock) as mock_values:
+            mock_values.return_value = ["1651"]  # Discord always sends select values back as strings
+            await view.select_callback(mock_interaction)
+
+        # Should never hit the "Could not find game details" bail-out path.
+        mock_interaction.response.send_message.assert_not_called()
+        args = mock_db.execute.call_args[0]
+        assert "INSERT OR REPLACE INTO wishlist" in args[0]
+        assert "1651" in args[1]
+
+@pytest.mark.asyncio
 async def test_itadbot_series_search_presents_selection():
     mock_interaction = MockInteraction()
     
